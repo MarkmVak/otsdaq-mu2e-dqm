@@ -5,6 +5,32 @@
 # cet_build_plugin(TrackerDQM art::module LIBRARIES REG
 #   )
 
+
+
+cet_build_plugin(CaloDQMOffline art::module LIBRARIES REG
+  otsdaq-mu2e::ArtModules
+  artdaq-core-mu2e::Data
+  artdaq-core-mu2e::Data_dict
+  artdaq-core-mu2e::Overlays
+  artdaq::DAQdata
+  art_root_io::TFileService_service
+  art_root_io::art_root_io
+  Offline::DAQ
+  Offline::CaloConditions
+  Offline::CaloVisualizer
+  Offline::CaloVisualizer_dict
+  Offline::Mu2eInterfaces
+  ROOT::Hist
+  ROOT::Tree
+  ROOT::Core
+  ROOT::RIO
+  ROOT::Gui
+  ROOT::Graf
+  BTrk_ProbTools
+  otsdaq::NetworkUtilities
+)
+
+
 cet_build_plugin(CaloDQM art::module LIBRARIES REG
 art_root_io::TFileService_service
 artdaq-core-mu2e::Data
