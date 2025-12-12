@@ -18,6 +18,11 @@
 #include "Offline/DataProducts/inc/CaloSiPMId.hh"
 #include "Offline/RecoDataProducts/inc/CaloDigi.hh"
 
+#include "fhiclcpp/types/Atom.h"
+#include "fhiclcpp/types/Sequence.h"
+#include "fhiclcpp/types/Table.h"
+
+#include "TH1.h"
 #include "TH1F.h"
 #include "TH2D.h"
 #include "TH2I.h"
@@ -25,71 +30,80 @@
 #include "TString.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
-#include <iostream>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 /*
- * CaloDQMOffline
+ * CaloDigiDQM
  *
- * Produces detector-aware monitoring outputs for the Mu2e calorimeter:
- *  - Global summaries per disk (occupancy, baseline, RMS, max ADC)
- *  - 2D summaries (board vs channel, waveform density)
- *  - Disk maps (per-SiPM heatmaps for Amp/Sum/Asym/Baseline/RMS)
- *  - Board-level 1D summaries and per-channel waveforms (live + first-hit snapshot)
- * Optionally streams histogram groups to otsdaq via HistoSender.
+ * Detector-aware monitoring for Mu2e calorimeter CaloDigi:
+ *  - Per-disk summaries vs contiguous channel index within disk (occupancy, baseline, RMS, peak ADC)
+ *  - Global integrity plots (board/channel dist, board-vs-channel occupancy, waveform "first-hit" density)
+ *  - Optional disk heatmaps (Amp/Sum/Asym/Baseline/RMS) via THMu2eCaloDisk
+ *  - Optional board summaries and per-channel waveforms (live + first-hit snapshot)
+ *
+ * Streaming:
+ *  - Summary groups every freqDQM
+ *  - Waveform groups every freqWaveforms
  */
 
 namespace mu2e
 {
 
-class CaloDQMOffline : public art::EDAnalyzer
+class CaloDigiDQM : public art::EDAnalyzer
 {
   public:
 	struct Config
 	{
+		// otsdaq streaming
 		fhicl::Atom<std::string> address{fhicl::Name("address"),
 		                                 "mu2edaq11-data.fnal.gov"};
 		fhicl::Atom<int>         port{fhicl::Name("port"), 6000};
 		fhicl::Atom<std::string> moduleTag{fhicl::Name("moduleTag"), "CaloDQM"};
-		fhicl::Atom<int>         freqDQM{fhicl::Name("freqDQM"), 100};
+		fhicl::Atom<bool>        sendHists{fhicl::Name("sendHists"), false};
 
+		// streaming cadence
+		fhicl::Atom<int> freqDQM{fhicl::Name("freqDQM"), 100};
+		fhicl::Atom<int> freqWaveforms{fhicl::Name("freqWaveforms"),
+		                               0};  // 0 = disable waveform streaming
+
+		// input + detail level
 		fhicl::Atom<std::string> caloDigiModuleLabel{fhicl::Name("caloDigiModuleLabel"),
 		                                             "CaloDigi"};
 		fhicl::Atom<bool> enableBoardHistos{fhicl::Name("enableBoardHistos"), true};
-		fhicl::Atom<int>  maxBoardHistos{fhicl::Name("maxBoardHistos"), -1};
-		fhicl::Atom<bool> enableLogging{fhicl::Name("enableLogging"), false};
-		fhicl::Atom<bool> sendHists{fhicl::Name("sendHists"), false};
+		fhicl::Atom<int>  maxBoardHistos{fhicl::Name("maxBoardHistos"),
+                                        -1};  // per disk; -1 = no limit
 
-		fhicl::Atom<bool> enableDiskMaps{fhicl::Name("enableDiskMaps"), true};
-
-		// diskCombines controls which disk maps are produced (["amp","baseline","rms","asym","sum"])
+		// disk maps
+		fhicl::Atom<bool>            enableDiskMaps{fhicl::Name("enableDiskMaps"), true};
 		fhicl::Sequence<std::string> diskCombines{fhicl::Name("diskCombines"),
 		                                          std::vector<std::string>{"asym"}};
-
-		fhicl::Atom<std::string> diskFormula{fhicl::Name("diskFormula"), ""};
 	};
 
-	explicit CaloDQMOffline(const art::EDAnalyzer::Table<Config>& config);
+	explicit CaloDigiDQM(const art::EDAnalyzer::Table<Config>& config);
 	void analyze(art::Event const& event) override;
 	void endJob() override;
 
   private:
 	// -----------------------
+	// Fixed waveform settings (NO FHiCL)
+	// -----------------------
+	static constexpr int kWaveformNBins       = 64;
+	static constexpr int kWaveformSizeHistMax = 200;
+
+	// -----------------------
 	// Map mode infrastructure
 	// -----------------------
-	// Amp: baseline-subtracted peak amplitude per SiPM
-	// Sum: L+R amplitude (heuristic energy proxy) when both sides present
-	// Asym: (L-R)/(L+R) to detect L/R gain mismatch or dead partner
-	// Baseline: mean of first few samples
-	// RMS: RMS of baseline window as noise proxy
 	enum class MapMode
 	{
 		Amp,
@@ -112,7 +126,6 @@ class CaloDQMOffline : public art::EDAnalyzer
 			return MapMode::Baseline;
 		if(s == "rms")
 			return MapMode::RMS;
-		// default / fallback
 		return MapMode::Amp;
 	}
 
@@ -152,7 +165,6 @@ class CaloDQMOffline : public art::EDAnalyzer
 		return "DiskAmp";
 	}
 
-	// Configure titles/axes/ranges for the disk heatmaps
 	void setDiskMapTitles(mu2e::THMu2eCaloDisk* h, int disk, MapMode mode)
 	{
 		if(!h)
@@ -164,27 +176,23 @@ class CaloDQMOffline : public art::EDAnalyzer
 		switch(mode)
 		{
 		case MapMode::Amp:
-			main   = "SiPM amplitude at peak (baseline-subtracted)";
+			main   = "SiPM amplitude (peak - baseline)";
 			ztitle = "Amplitude [ADC]";
 			break;
-
 		case MapMode::Sum:
-			main   = "Crystal energy proxy: L+R amplitude";
+			main   = "Crystal sum (L+R) amplitude";
 			ztitle = "L+R [ADC]";
 			break;
-
 		case MapMode::Asym:
-			main   = "SiPM asymmetry (L-R)/(L+R)";
-			ztitle = "Asymmetry (L-R)/(L+R)";
-			h->SetMinimum(-1.0);  // physical bounds of asymmetry
+			main   = "Asymmetry (L-R)/(L+R)";
+			ztitle = "Asymmetry";
+			h->SetMinimum(-1.0);
 			h->SetMaximum(1.0);
 			break;
-
 		case MapMode::Baseline:
-			main   = "SiPM baseline (mean of first samples)";
+			main   = "SiPM baseline";
 			ztitle = "Baseline [ADC]";
 			break;
-
 		case MapMode::RMS:
 			main   = "SiPM baseline RMS";
 			ztitle = "RMS [ADC]";
@@ -197,216 +205,368 @@ class CaloDQMOffline : public art::EDAnalyzer
 		h->SetStats(0);
 	}
 
-	// --------------
+	// -----------------------
+	// Geometry / encoding
+	// -----------------------
+	static constexpr int kNDisks           = 2;
+	static constexpr int kBoardsPerDisk    = 80;
+	static constexpr int kChannelsPerBoard = 20;
+	static constexpr int kChannelsPerDisk  = kBoardsPerDisk * kChannelsPerBoard;
+
+	static int boardMinForDisk(int disk) { return disk * kBoardsPerDisk; }
+
+	// Contiguous channel index within disk: 0..(kChannelsPerDisk-1)
+	static int encodeChannel(int disk, int boardID, int chanID)
+	{
+		const int bmin = boardMinForDisk(disk);
+		return (boardID - bmin) * kChannelsPerBoard + chanID;
+	}
+
+	struct EncodedAxisConfig
+	{
+		int    nBins;
+		double xMin;
+		double xMax;
+	};
+
+	static EncodedAxisConfig axisForDisk(int /*disk*/)
+	{
+		return EncodedAxisConfig{kChannelsPerDisk, 0.0, (double)kChannelsPerDisk};
+	}
+
+	struct ChannelKey
+	{
+		int disk;
+		int board;
+		int chan;
+
+		bool operator<(ChannelKey const& o) const
+		{
+			if(disk != o.disk)
+				return disk < o.disk;
+			if(board != o.board)
+				return board < o.board;
+			return chan < o.chan;
+		}
+	};
+
+	// -----------------------
+	// Disk-map MEAN semantics
+	// -----------------------
+	static void ensureSize(std::vector<double>& v, size_t idx)
+	{
+		if(v.size() <= idx)
+			v.resize(idx + 1, 0.0);
+	}
+	static void ensureSize(std::vector<uint32_t>& v, size_t idx)
+	{
+		if(v.size() <= idx)
+			v.resize(idx + 1, 0u);
+	}
+
+	// Safety cap: prevents accidental huge allocations if sipmId is corrupt
+	static constexpr int kMaxSipmIdForMaps_ = 10000;
+	bool                 warnedBadSipmId_{false};
+	int                  nBadSipmId_{0};
+
+	void accDisk(MapMode m, int disk, int sipmId, double val)
+	{
+		if(disk < 0 || disk >= kNDisks)
+			return;
+
+		if(sipmId < 0 || sipmId >= kMaxSipmIdForMaps_)
+		{
+			++nBadSipmId_;
+			if(!warnedBadSipmId_)
+			{
+				warnedBadSipmId_ = true;
+				mf::LogWarning("CaloDigiDQM")
+				    << "Out-of-range sipmId=" << sipmId << " (cap=" << kMaxSipmIdForMaps_
+				    << "). Disk-map accumulation will skip these.";
+			}
+			return;
+		}
+
+		auto& sumv = diskSum_[m][disk];
+		auto& cntv = diskCnt_[m][disk];
+
+		ensureSize(sumv, (size_t)sipmId);
+		ensureSize(cntv, (size_t)sipmId);
+
+		sumv[(size_t)sipmId] += val;
+		cntv[(size_t)sipmId] += 1;
+	}
+
+	void refreshDiskMaps()
+	{
+		if(!enableDiskMaps_)
+			return;
+
+		for(auto m : modes_)
+		{
+			for(int disk = 0; disk < kNDisks; ++disk)
+			{
+				auto* h = (disk == 0) ? disk0Maps_[m] : disk1Maps_[m];
+				if(!h)
+					continue;
+
+				h->Reset("ICESM");
+				setDiskMapTitles(h, disk, m);
+
+				auto& sumv = diskSum_[m][disk];
+				auto& cntv = diskCnt_[m][disk];
+
+				size_t n = std::min(sumv.size(), cntv.size());
+				for(size_t sipm = 0; sipm < n; ++sipm)
+				{
+					if(cntv[sipm] == 0u)
+						continue;
+					h->FillOffline((int)sipm, sumv[sipm] / (double)cntv[sipm]);
+				}
+			}
+		}
+	}
+
+	// -----------------------
+	// Fixed-bin waveform fill
+	// -----------------------
+	template<class WaveformT>
+	void fillFixedWaveform(TH1F* h, WaveformT const& wf) const
+	{
+		if(!h)
+			return;
+
+		const int nb = h->GetNbinsX();
+		const int n  = std::min<int>((int)wf.size(), nb);
+
+		for(int i = 0; i < n; ++i)
+			h->SetBinContent(i + 1, (double)wf[(size_t)i]);
+		for(int i = n; i < nb; ++i)
+			h->SetBinContent(i + 1, 0.0);
+	}
+
+	// -----------------------
+	// Waveform-size bookkeeping (no spam)
+	// -----------------------
+	struct WaveformSizeStats
+	{
+		uint32_t first{0}, last{0}, min{0}, max{0};
+		uint32_t nSeen{0}, nMismatchToFirst{0}, nTransitions{0};
+		uint32_t nTruncated{0}, nPadded{0};
+	};
+
+	// -----------------------
 	// Data members
-	// --------------
-	std::vector<MapMode> modes_;  // enabled map modes from FHiCL
+	// -----------------------
+	std::vector<MapMode> modes_;
 
 	art::InputTag caloDigiTag_;
 	std::string   caloDigiModuleLabel_;
-	bool          enableBoardHistos_;
-	int           maxBoardHistos_;
-	bool          enableLogging_;
-	int           freqDQM_;
-	std::string   address_;
-	int           port_;
-	std::string   moduleTag_;
-	bool          sendHists_;
 
-	ots::HistoSender* histSender_{nullptr};
-	int               eventCounter_ = 0;
+	bool        enableBoardHistos_;
+	int         maxBoardHistos_;
+	int         freqDQM_;
+	int         freqWaveforms_;
+	std::string address_;
+	int         port_;
+	std::string moduleTag_;
+	bool        sendHists_;
 
-	// Event-level counters for quick health checks (filled/missed by disk)
-	int nFillDisk0_{0};
-	int nFillDisk1_{0};
-	int nFillMiss_{0};
+	std::unique_ptr<ots::HistoSender> histSender_;
+	int                               eventCounter_{0};
+	int                               waveformCounter_{0};
+	int                               histSendErrorCount_{0};
+	static constexpr int              kMaxSendErrors_ = 10;
 
-	// Board-level containers:
-	//  - boardHistos_: per-board summary histograms keyed by (disk,boardID)
-	//  - cached{Histos,Channels}Dirs_: lazily-created TFile subdirectories
-	std::map<std::pair<int, int>, std::map<std::string, TH1F*>>         boardHistos_;
+	bool enableDiskMaps_{true};
+
+	int nFillDisk0_{0}, nFillDisk1_{0}, nFillMiss_{0};
+
+	std::set<int> boardsSeenDisk0_;
+	std::set<int> boardsSeenDisk1_;
+
+	// Thread-safe: member (not static in analyze)
+	std::set<std::pair<int, int>> warnedBoardsSkipped_;
+
+	// Board-level summaries: keyed by (disk,boardID) -> {"occ","base","rms","max"} -> TH1*
+	std::map<std::pair<int, int>, std::map<std::string, TH1*>>          boardHistos_;
 	std::map<std::pair<int, int>, std::unique_ptr<art::TFileDirectory>> cachedHistosDirs_;
 	std::map<std::pair<int, int>, std::unique_ptr<art::TFileDirectory>>
 	    cachedChannelsDirs_;
 
-	// Per-channel waveforms:
-	//  - channelWaveformHistos_: live-updating waveforms
-	//  - singleWaveformHistos_: first-hit snapshot (one per channel)
-	//  - channelWaveformStored_: guard set to avoid duplicating snapshots
-	std::map<std::string, TH1F*> channelWaveformHistos_;
-	std::map<std::string, TH1F*> singleWaveformHistos_;
-	std::set<std::string>        channelWaveformStored_;
+	// Per-channel waveforms
+	std::map<ChannelKey, TH1F*>             channelWaveformHistos_;  // live (last hit)
+	std::map<ChannelKey, TH1F*>             singleWaveformHistos_;   // first-hit snapshot
+	std::set<ChannelKey>                    channelWaveformStored_;  // guard
+	std::map<ChannelKey, WaveformSizeStats> wfSizeStats_;            // size stats
 
-	// Temporary per-event caches to pair L/R channels and compute asymmetry
-	std::map<int, float> maxValueBySiPM;
-	std::map<int, int>   crystalIdBySiPM;
-
-	bool        enableDiskMaps_;
-	std::string diskFormula_;
-
-	// Top-level TFileService directories
+	// TFileService folders
 	std::unique_ptr<art::TFileDirectory> disk0Dir_;
 	std::unique_ptr<art::TFileDirectory> disk1Dir_;
 	std::unique_ptr<art::TFileDirectory> globalDir_;
 
-	// For each map mode: make a subfolder and two THMu2eCaloDisk heatmaps (Disk 0/1)
+	// Disk maps per mode (Disk0/Disk1)
 	std::map<MapMode, art::TFileDirectory>   diskMapDirs_;
 	std::map<MapMode, mu2e::THMu2eCaloDisk*> disk0Maps_;
 	std::map<MapMode, mu2e::THMu2eCaloDisk*> disk1Maps_;
 
-	// -------- Global / summary histograms --------
-	// h_asymmetry: distribution of (L-R)/(L+R) across all crystals to detect L/R imbalance
-	TH1F* h_asymmetry{nullptr};
+	// Disk-map running mean buffers: [mode][disk][sipm]
+	std::map<MapMode, std::array<std::vector<double>, kNDisks>>   diskSum_;
+	std::map<MapMode, std::array<std::vector<uint32_t>, kNDisks>> diskCnt_;
 
-	// h_baseline_vs_disk: profile of average baseline per disk (bin 1=Disk0, bin 2=Disk1)
+	// Global/summaries
+	TH1F*     h_asymmetry{nullptr};
 	TProfile* h_baseline_vs_disk{nullptr};
 
-	// h_occupancy_diskX_: per-disk occupancy vs encoded channel index (boardID*100+chanID)
-	TH1F* h_occupancy_disk0_{nullptr};
-	TH1F* h_occupancy_disk1_{nullptr};
+	TH1F*     h_occupancy_disk0_{nullptr};
+	TH1F*     h_occupancy_disk1_{nullptr};
+	TProfile* h_baseline_disk0_{nullptr};
+	TProfile* h_baseline_disk1_{nullptr};
+	TProfile* h_rms_disk0_{nullptr};
+	TProfile* h_rms_disk1_{nullptr};
+	TProfile* h_maxval_disk0_{nullptr};
+	TProfile* h_maxval_disk1_{nullptr};
 
-	// h_baseline_diskX_: per-disk baseline vs encoded channel (filled with value as weight)
-	TH1F* h_baseline_disk0_{nullptr};
-	TH1F* h_baseline_disk1_{nullptr};
+	TH1F* h_global_channel_dist_{nullptr};
+	TH1F* h_global_board_dist_{nullptr};
 
-	// h_rms_diskX_: per-disk baseline RMS (noise proxy) vs encoded channel
-	TH1F* h_rms_disk0_{nullptr};
-	TH1F* h_rms_disk1_{nullptr};
-
-	// h_maxval_diskX_: per-disk peak ADC (raw, not baseline-subtracted) vs encoded channel
-	TH1F* h_maxval_disk0_{nullptr};
-	TH1F* h_maxval_disk1_{nullptr};
-
-	// Global ID distributions for quick sanity checks
-	TH1F* h_global_channel_dist_{nullptr};  // counts by channel ID [0..19]
-	TH1F* h_global_board_dist_{nullptr};    // counts by board ID   [0..159]
-
-	// h_global_board_vs_channel_: 2D hit occupancy per (boardID,chanID)
 	TH2I* h_global_board_vs_channel_{nullptr};
-
-	// h_global_waveform_density_: 2D density over (tick,ADC) aggregated from first-hit snapshots
 	TH2D* h_global_waveform_density_{nullptr};
 
-	// Mapping from SiPMID to raw electronics IDs (board/chan) and disk
+	TH1F* h_waveform_size_{nullptr};
+
+	// Electronics mapping: SiPMID -> rawId -> board/channel/disk
 	mu2e::ProditionsHandle<mu2e::CaloDAQMap> _calodaqconds_h;
 };
+
+static TString channelLabel(int boardID, int chanID, int rawId, int sipmId)
+{
+	return Form("B%03d C%02d (raw: %d, offline: %d)", boardID, chanID, rawId, sipmId);
+}
 
 // ===========================
 // Constructor
 // ===========================
-CaloDQMOffline::CaloDQMOffline(const art::EDAnalyzer::Table<Config>& config)
-    : EDAnalyzer{config}
+CaloDigiDQM::CaloDigiDQM(const art::EDAnalyzer::Table<Config>& config)
+    : art::EDAnalyzer{config}
     , caloDigiTag_{config().caloDigiModuleLabel()}
     , caloDigiModuleLabel_(config().caloDigiModuleLabel())
     , enableBoardHistos_(config().enableBoardHistos())
     , maxBoardHistos_(config().maxBoardHistos())
-    , enableLogging_(config().enableLogging())
     , freqDQM_(config().freqDQM())
+    , freqWaveforms_(config().freqWaveforms())
     , address_(config().address())
     , port_(config().port())
     , moduleTag_(config().moduleTag())
     , sendHists_(config().sendHists())
     , enableDiskMaps_(config().enableDiskMaps())
-    , diskFormula_(config().diskFormula())
 {
-	// Parse enabled disk map modes from FHiCL (defaults to {"asym"} if empty)
+	// Parse enabled disk map modes (fallback to {"asym"})
 	std::vector<std::string> rawModes = config().diskCombines();
 	if(rawModes.empty())
-		rawModes = {"asym"};  // fallback
+		rawModes = {"asym"};
 
 	modes_.reserve(rawModes.size());
 	for(auto& s : rawModes)
-	{
 		modes_.push_back(parseMode(s));
-	}
 
-	// Initialize sender if streaming is enabled
+	// HistoSender (optional)
 	if(sendHists_)
-	{
-		histSender_ = new ots::HistoSender(address_, port_);
-	}
+		histSender_ = std::make_unique<ots::HistoSender>(address_, port_);
 
-	// Create top-level directories: Disk0, Disk1, Global_Histograms
+	// Top-level output folders
 	art::ServiceHandle<art::TFileService> tfs;
 	disk0Dir_  = std::make_unique<art::TFileDirectory>(tfs->mkdir("Disk0"));
 	disk1Dir_  = std::make_unique<art::TFileDirectory>(tfs->mkdir("Disk1"));
 	globalDir_ = std::make_unique<art::TFileDirectory>(tfs->mkdir("Global_Histograms"));
 
-	// --- Global histograms ---
+	// Contiguous axes per disk (0..kChannelsPerDisk)
+	auto axisD0 = axisForDisk(0);
+	auto axisD1 = axisForDisk(1);
 
-	// Occupancy per encoded channel (x = boardID*100 + chanID). Y counts hits.
-	h_occupancy_disk0_ =
-	    disk0Dir_->make<TH1F>("h_occ_d0", "Occupancy (Disk 0)", 8020, 0, 8020);
-	h_occupancy_disk0_->GetXaxis()->SetTitle("Encoded Channel (boardID * 100 + chanID)");
+	// Per-disk occupancy vs contiguous channel index
+	h_occupancy_disk0_ = disk0Dir_->make<TH1F>(
+	    "h_occ_d0", "Occupancy (Disk 0)", axisD0.nBins, axisD0.xMin, axisD0.xMax);
+	h_occupancy_disk0_->GetXaxis()->SetTitle(
+	    "Channel index within disk ((boardID-boardMin)*20 + chanID)");
 	h_occupancy_disk0_->GetYaxis()->SetTitle("Hit Count");
 
-	h_occupancy_disk1_ =
-	    disk1Dir_->make<TH1F>("h_occ_d1", "Occupancy (Disk 1)", 7920, 8000, 15920);
-	h_occupancy_disk1_->GetXaxis()->SetTitle("Encoded Channel (boardID * 100 + chanID)");
+	h_occupancy_disk1_ = disk1Dir_->make<TH1F>(
+	    "h_occ_d1", "Occupancy (Disk 1)", axisD1.nBins, axisD1.xMin, axisD1.xMax);
+	h_occupancy_disk1_->GetXaxis()->SetTitle(
+	    "Channel index within disk ((boardID-boardMin)*20 + chanID)");
 	h_occupancy_disk1_->GetYaxis()->SetTitle("Hit Count");
 
-	// 2D occupancy index: good for spotting missing rows/columns or swapped cabling
+	// Global 2D occupancy (true occupancy; filled every hit)
 	h_global_board_vs_channel_ = globalDir_->make<TH2I>(
-	    "h_board_vs_channel", "Board vs Channel", 160, 0, 160, 20, 0, 20);
+	    "h_board_vs_channel", "Board vs Channel Occupancy", 160, 0, 160, 20, 0, 20);
 	h_global_board_vs_channel_->GetXaxis()->SetTitle("Board ID");
 	h_global_board_vs_channel_->GetYaxis()->SetTitle("Channel ID");
 
-	// Aggregated waveform shape: x=tick, y=ADC; highlights global saturation, clipping, or drift
-	h_global_waveform_density_ = globalDir_->make<TH2D>(
-	    "h_waveform_density", "Waveform Density", 150, 0, 150, 400, 2000, 4095);
+	// Global waveform density (built from first-hit snapshot per channel)
+	h_global_waveform_density_ =
+	    globalDir_->make<TH2D>("h_waveform_density",
+	                           "Waveform Density (first-hit per channel)",
+	                           150,
+	                           0,
+	                           150,
+	                           400,
+	                           2000,
+	                           4095);
 	h_global_waveform_density_->GetXaxis()->SetTitle("Tick");
 	h_global_waveform_density_->GetYaxis()->SetTitle("ADC Value");
 
-	// Baseline and noise (RMS) per encoded channel; used to detect hot/noisy channels
-	h_baseline_disk0_ =
-	    disk0Dir_->make<TH1F>("h_base_d0", "Baseline (Disk 0)", 8020, 0, 8020);
-	h_baseline_disk0_->SetMarkerStyle(20);
-	h_baseline_disk0_->GetXaxis()->SetTitle("Encoded Channel (boardID * 100 + chanID)");
-	h_baseline_disk0_->GetYaxis()->SetTitle("Baseline");
+	// Distribution of waveform.size()
+	const int sizeMax = std::max(10, kWaveformSizeHistMax);
+	h_waveform_size_  = globalDir_->make<TH1F>(
+        "h_waveform_size", "Waveform size distribution", sizeMax, 0, sizeMax);
+	h_waveform_size_->GetXaxis()->SetTitle("waveform.size() [samples]");
+	h_waveform_size_->GetYaxis()->SetTitle("Count");
 
-	h_baseline_disk1_ =
-	    disk1Dir_->make<TH1F>("h_base_d1", "Baseline (Disk 1)", 7920, 8000, 15920);
-	h_baseline_disk1_->SetMarkerStyle(20);
-	h_baseline_disk1_->GetXaxis()->SetTitle("Encoded Channel (boardID * 100 + chanID)");
-	h_baseline_disk1_->GetYaxis()->SetTitle("Baseline");
+	// Helper to book per-disk mean profiles vs contiguous channel index
+	auto makeValueVsEncoded = [&](art::TFileDirectory& dir,
+	                              const char*          name,
+	                              const char*          title,
+	                              int                  disk,
+	                              const char*          yTitle) -> TProfile* {
+		EncodedAxisConfig ax = axisForDisk(disk);
+		auto*             h = dir.make<TProfile>(name, title, ax.nBins, ax.xMin, ax.xMax);
+		h->SetMarkerStyle(20);
+		h->GetXaxis()->SetTitle(
+		    "Channel index within disk ((boardID-boardMin)*20 + chanID)");
+		h->GetYaxis()->SetTitle(yTitle);
+		return h;
+	};
 
-	h_rms_disk0_ = disk0Dir_->make<TH1F>("h_rms_d0", "RMS (Disk 0)", 8020, 0, 8020);
-	h_rms_disk0_->SetMarkerStyle(20);
-	h_rms_disk0_->GetXaxis()->SetTitle("Encoded Channel (boardID * 100 + chanID)");
-	h_rms_disk0_->GetYaxis()->SetTitle("Baseline RMS");
+	h_baseline_disk0_ = makeValueVsEncoded(
+	    *disk0Dir_, "h_base_d0", "Baseline (Disk 0)", 0, "Mean Baseline [ADC]");
+	h_baseline_disk1_ = makeValueVsEncoded(
+	    *disk1Dir_, "h_base_d1", "Baseline (Disk 1)", 1, "Mean Baseline [ADC]");
 
-	h_rms_disk1_ = disk1Dir_->make<TH1F>("h_rms_d1", "RMS (Disk 1)", 7920, 8000, 15920);
-	h_rms_disk1_->SetMarkerStyle(20);
-	h_rms_disk1_->GetXaxis()->SetTitle("Encoded Channel (boardID * 100 + chanID)");
-	h_rms_disk1_->GetYaxis()->SetTitle("Baseline RMS");
+	h_rms_disk0_ =
+	    makeValueVsEncoded(*disk0Dir_, "h_rms_d0", "RMS (Disk 0)", 0, "Mean RMS [ADC]");
+	h_rms_disk1_ =
+	    makeValueVsEncoded(*disk1Dir_, "h_rms_d1", "RMS (Disk 1)", 1, "Mean RMS [ADC]");
 
-	// Peak ADC per encoded channel (raw). Useful to catch saturation and dead channels.
-	h_maxval_disk0_ =
-	    disk0Dir_->make<TH1F>("h_max_d0", "Max ADC (Disk 0)", 8020, 0, 8020);
-	h_maxval_disk0_->SetMarkerStyle(20);
-	h_maxval_disk0_->GetXaxis()->SetTitle("Encoded Channel (boardID * 100 + chanID)");
-	h_maxval_disk0_->GetYaxis()->SetTitle("Maximum ADC Value");
+	h_maxval_disk0_ = makeValueVsEncoded(
+	    *disk0Dir_, "h_max_d0", "Max ADC (Disk 0)", 0, "Mean Peak ADC [ADC]");
+	h_maxval_disk1_ = makeValueVsEncoded(
+	    *disk1Dir_, "h_max_d1", "Max ADC (Disk 1)", 1, "Mean Peak ADC [ADC]");
 
-	h_maxval_disk1_ =
-	    disk1Dir_->make<TH1F>("h_max_d1", "Max ADC (Disk 1)", 7920, 8000, 15920);
-	h_maxval_disk1_->SetMarkerStyle(20);
-	h_maxval_disk1_->GetXaxis()->SetTitle("Encoded Channel (boardID * 100 + chanID)");
-	h_maxval_disk1_->GetYaxis()->SetTitle("Maximum ADC Value");
-
-	// Disk-level average baseline; shows offsets/mode changes between disks
+	// Disk-level baseline comparison
 	h_baseline_vs_disk =
 	    globalDir_->make<TProfile>("h_base_vs_d", "Baseline vs Disk", 2, 0, 2);
 	h_baseline_vs_disk->GetXaxis()->SetBinLabel(1, "Disk 0");
 	h_baseline_vs_disk->GetXaxis()->SetBinLabel(2, "Disk 1");
 	h_baseline_vs_disk->GetYaxis()->SetTitle("Mean Baseline [ADC]");
 
-	// Global LR asymmetry; centered near 0 ideally. Tails signal imbalance or dead partner.
+	// Global asymmetry distribution
 	h_asymmetry =
 	    globalDir_->make<TH1F>("h_asym", "Left-Right Asymmetry", 100, -1.0, 1.0);
 	h_asymmetry->GetXaxis()->SetTitle("(L - R)/(L + R)");
 	h_asymmetry->GetYaxis()->SetTitle("Frequency");
 
-	// Quick integrity checks for ID distributions
+	// Global ID distributions
 	h_global_channel_dist_ = globalDir_->make<TH1F>(
 	    "h_channel_dist", "Global Channel Distribution", 20, 0, 20);
 	h_global_channel_dist_->GetXaxis()->SetTitle("Channel ID");
@@ -417,7 +577,7 @@ CaloDQMOffline::CaloDQMOffline(const art::EDAnalyzer::Table<Config>& config)
 	h_global_board_dist_->GetXaxis()->SetTitle("Board ID");
 	h_global_board_dist_->GetYaxis()->SetTitle("Frequency");
 
-	// --- Disk maps per mode, grouped into subfolders like DiskAmp, DiskAsym, ...
+	// Disk maps per enabled mode
 	if(enableDiskMaps_)
 	{
 		for(auto m : modes_)
@@ -428,20 +588,13 @@ CaloDQMOffline::CaloDQMOffline(const art::EDAnalyzer::Table<Config>& config)
 			auto& modeDir =
 			    diskMapDirs_.try_emplace(m, globalDir_->mkdir(folder)).first->second;
 
-			std::string key0 = Form("disk0_%s", suf);
-			std::string key1 = Form("disk1_%s", suf);
-
+			std::string key0   = Form("disk0_%s", suf);
+			std::string key1   = Form("disk1_%s", suf);
 			std::string title0 = Form("Disk 0 - %s", suf);
 			std::string title1 = Form("Disk 1 - %s", suf);
 
-			// THMu2eCaloDisk: calorimeter layout heatmap; FillOffline(sipmId,value) sets z-content
 			auto* d0 = modeDir.makeAndRegister<mu2e::THMu2eCaloDisk>(
-			    key0.c_str(),
-			    title0.c_str(),  // key, TFile title
-			    key0.c_str(),
-			    title0.c_str(),  // in-object name/title
-			    0);              // disk index
-
+			    key0.c_str(), title0.c_str(), key0.c_str(), title0.c_str(), 0);
 			auto* d1 = modeDir.makeAndRegister<mu2e::THMu2eCaloDisk>(
 			    key1.c_str(), title1.c_str(), key1.c_str(), title1.c_str(), 1);
 
@@ -456,392 +609,494 @@ CaloDQMOffline::CaloDQMOffline(const art::EDAnalyzer::Table<Config>& config)
 // ===========================
 // analyze()
 // ===========================
-void CaloDQMOffline::analyze(art::Event const& event)
+void CaloDigiDQM::analyze(art::Event const& event)
 {
-	// Reset per-event pairing caches
-	maxValueBySiPM.clear();
-	crystalIdBySiPM.clear();
-
-	mf::LogInfo("CaloDQMOffline") << "CaloDQMOffline is running.";
-
-	// Input collection of SiPM waveforms
-	const auto& caloDigis = *event.getValidHandle<CaloDigiCollection>(caloDigiTag_);
-
-	// Electronics mapping (SiPMID -> rawId -> board/channel, also implies disk)
+	// Input
+	const auto& caloDigis    = *event.getValidHandle<CaloDigiCollection>(caloDigiTag_);
 	const auto& calodaqconds = _calodaqconds_h.get(event.id());
+
+	// Per-event cache (used to compute Sum/Asym once per crystal)
+	struct SipmFeat
+	{
+		double amp;
+		double baseline;
+		double rms;
+		double ampRaw;
+		int    disk;
+	};
+	std::map<int, SipmFeat> featBySipm;
+	std::set<int>           pairedCrystals;
 
 	for(const auto& digi : caloDigis)
 	{
 		const auto& waveform = digi.waveform();
+
+		// Record waveform.size() distribution (global)
+		if(h_waveform_size_)
+			h_waveform_size_->Fill((int)waveform.size());
+
+		// Basic validity (need baseline window and a peak position)
 		if(waveform.size() < 5 || digi.peakpos() >= (int)waveform.size())
 			continue;
 
-		// Basic features from a fixed "baseline" window at the start of the waveform
-		float baseline =
+		// Baseline + RMS from first 5 samples
+		const float baseline =
 		    std::accumulate(waveform.begin(), waveform.begin() + 5, 0.0f) / 5.0f;
 
-		float mean_sq =
+		const float mean_sq =
 		    std::inner_product(
 		        waveform.begin(), waveform.begin() + 5, waveform.begin(), 0.0f) /
 		    5.0f;
 
-		float rms = (mean_sq > baseline * baseline)
-		                ? std::sqrt(mean_sq - baseline * baseline)
-		                : 0.0f;
+		const float rms = (mean_sq > baseline * baseline)
+		                      ? std::sqrt(mean_sq - baseline * baseline)
+		                      : 0.0f;
 
 		if(!std::isfinite(baseline) || !std::isfinite(rms))
 			continue;
 
-		// SiPM and crystal pairing info to compute L/R quantities
-		int sipmId              = digi.SiPMID();
-		int crystalId           = sipmId / 2;
-		crystalIdBySiPM[sipmId] = crystalId;
+		// Feature values
+		const int    sipmId = digi.SiPMID();
+		const float  ampRaw = waveform[digi.peakpos()];
+		const double amp    = (double)ampRaw - (double)baseline;
 
-		const float ampRaw =
-		    waveform[digi.peakpos()];  // raw peak (not baseline-subtracted)
-		maxValueBySiPM[sipmId] = ampRaw;
-
-		// partnerSiPM: even->odd, odd->even (two SiPMs per crystal)
-		const int partnerSiPM = (sipmId % 2 == 0) ? (sipmId + 1) : (sipmId - 1);
-
-		double L = 0.0, R = 0.0;
-		bool   haveLR = false;
-
-		auto itP = maxValueBySiPM.find(partnerSiPM);
-		auto itC = crystalIdBySiPM.find(partnerSiPM);
-		if(itP != maxValueBySiPM.end() && itC != crystalIdBySiPM.end() &&
-		   crystalIdBySiPM[sipmId] == itC->second)
-		{
-			// Convention: even index is "L", odd is "R"
-			if(sipmId % 2 == 0)
-			{
-				L = maxValueBySiPM[sipmId];
-				R = itP->second;
-			}
-			else
-			{
-				L = itP->second;
-				R = maxValueBySiPM[sipmId];
-			}
-			haveLR = true;
-		}
-
-		// Fill global asymmetry once a valid LR pair is seen
-		if(haveLR)
-		{
-			const double denom = L + R;
-			const double asym  = (denom > 0.0) ? (L - R) / denom : 0.0;
-			h_asymmetry->Fill(asym);
-		}
-
-		// SiPM -> rawID -> board/chan/disk; rawId==9999 indicates missing mapping
-		int rawId = calodaqconds.rawId(mu2e::CaloSiPMId(sipmId)).id();
+		// Map to electronics IDs (SiPMID -> rawId -> board/channel/disk)
+		const int rawId = calodaqconds.rawId(mu2e::CaloSiPMId(sipmId)).id();
 		if(rawId == 9999)
 			continue;
 
-		int boardID = rawId / 20;    // 20 channels per board
-		int chanID  = rawId % 20;    // channel within board
-		int disk    = boardID / 80;  // 80 boards per disk => 0 or 1
+		const int boardID = rawId / kChannelsPerBoard;
+		const int chanID  = rawId % kChannelsPerBoard;
 
-		// Encoded 1D index used for per-disk 1D histograms
-		int encoded = boardID * 100 + chanID;
+		// NOTE: disk derived from boardID partition (assumes board numbering is disk-partitioned)
+		const int disk = boardID / kBoardsPerDisk;
 
-		// Physics values for map modes
-		const double amp = ampRaw - baseline;  // baseline-subtracted peak
-		const double sumLR =
-		    haveLR ? (L + R) : ampRaw;  // fallback to raw peak if partner missing
-		const double asymLR  = (haveLR && (L + R) > 0.0) ? (L - R) / (L + R) : 0.0;
-		const double baseVal = baseline;
-		const double rmsVal  = rms;
-
-		// Fill disk heatmaps (per-SiPM value) for enabled modes
-		if(enableDiskMaps_)
+		if(disk < 0 || disk >= kNDisks)
 		{
-			for(auto m : modes_)
-			{
-				double val = 0.0;
-				switch(m)
-				{
-				case MapMode::Amp:
-					val = amp;
-					break;
-				case MapMode::Sum:
-					val = sumLR;
-					break;
-				case MapMode::Asym:
-					val = asymLR;
-					break;
-				case MapMode::Baseline:
-					val = baseVal;
-					break;
-				case MapMode::RMS:
-					val = rmsVal;
-					break;
-				}
-
-				if(disk == 0 && disk0Maps_[m])
-				{
-					disk0Maps_[m]->FillOffline(sipmId, val);
-				}
-				else if(disk == 1 && disk1Maps_[m])
-				{
-					disk1Maps_[m]->FillOffline(sipmId, val);
-				}
-			}
+			++nFillMiss_;
+			continue;
 		}
 
-		// Bookkeeping counters
+		const int encoded = encodeChannel(disk, boardID, chanID);
+
 		if(disk == 0)
 			++nFillDisk0_;
-		else if(disk == 1)
-			++nFillDisk1_;
 		else
-			++nFillMiss_;
+			++nFillDisk1_;
 
-		// Global distributions for quick sanity checks
+		// Global occupancy plots
 		h_global_board_dist_->Fill(boardID);
 		h_global_channel_dist_->Fill(chanID);
+		h_global_board_vs_channel_->Fill(boardID, chanID);
 
-		// Per-disk 1D summaries vs encoded channel
+		// Per-disk 1D summaries
 		(disk == 0 ? h_occupancy_disk0_ : h_occupancy_disk1_)->Fill(encoded);
 		(disk == 0 ? h_baseline_disk0_ : h_baseline_disk1_)->Fill(encoded, baseline);
 		(disk == 0 ? h_rms_disk0_ : h_rms_disk1_)->Fill(encoded, rms);
 		(disk == 0 ? h_maxval_disk0_ : h_maxval_disk1_)->Fill(encoded, ampRaw);
-
-		// Disk-level baseline profile (bin centers at 0.5/1.5 encode disk index)
 		h_baseline_vs_disk->Fill(disk == 0 ? 0.5 : 1.5, baseline);
 
-		// ---------------------------
-		// Board-level / channel-level
-		// ---------------------------
-		if(enableBoardHistos_ &&
-		   (maxBoardHistos_ < 0 || (int)boardHistos_.size() < maxBoardHistos_))
+		// Disk-map running means (Amp/Baseline/RMS)
+		if(enableDiskMaps_)
 		{
-			std::pair<int, int> boardKey = std::make_pair(disk, boardID);
+			accDisk(MapMode::Amp, disk, sipmId, amp);
+			accDisk(MapMode::Baseline, disk, sipmId, baseline);
+			accDisk(MapMode::RMS, disk, sipmId, rms);
+		}
 
-			// Create per-board folders on first encounter:
-			//   DiskX/Board_YYY/Histograms for 1D summaries
-			//   DiskX/Board_YYY/Channels   for per-channel waveforms (first-hit snapshots)
-			if(cachedHistosDirs_.find(boardKey) == cachedHistosDirs_.end())
+		// Cache this SiPM for L/R pairing
+		featBySipm[sipmId] = SipmFeat{amp, baseline, rms, (double)ampRaw, disk};
+
+		// Compute Sum/Asym once per crystal (order-independent)
+		const int crystalId = sipmId / 2;
+		if(pairedCrystals.count(crystalId) == 0)
+		{
+			const int evenId = 2 * crystalId;
+			const int oddId  = evenId + 1;
+
+			auto itL = featBySipm.find(evenId);
+			auto itR = featBySipm.find(oddId);
+
+			if(itL != featBySipm.end() && itR != featBySipm.end())
 			{
-				art::TFileDirectory boardDir =
-				    (disk == 0 ? *disk0Dir_ : *disk1Dir_)
-				        .mkdir("Board_" + std::to_string(boardID));
+				pairedCrystals.insert(crystalId);
 
-				cachedHistosDirs_[boardKey] =
-				    std::make_unique<art::TFileDirectory>(boardDir.mkdir("Histograms"));
+				const double L = itL->second.amp;
+				const double R = itR->second.amp;
 
-				cachedChannelsDirs_[boardKey] =
-				    std::make_unique<art::TFileDirectory>(boardDir.mkdir("Channels"));
-			}
+				const double denom = L + R;
+				const double sumLR = denom;
+				const double asym  = (denom != 0.0) ? (L - R) / denom : 0.0;
 
-			art::TFileDirectory& histosDir = *cachedHistosDirs_[boardKey];
-			auto&                histos    = boardHistos_[boardKey];
+				h_asymmetry->Fill(asym);
 
-			if(histos.empty())
-			{
-				// Occupancy per channel (0..19)
-				histos["occ"] =
-				    histosDir.make<TH1F>(Form("D%d_B%03d_Occupancy", disk, boardID),
-				                         Form("Occupancy for D%d B%03d", disk, boardID),
-				                         20,
-				                         0,
-				                         20);
-				histos["occ"]->GetXaxis()->SetTitle("Channel ID");
-				histos["occ"]->GetYaxis()->SetTitle("Count");
-
-				// Baseline distribution per channel (filled with value as weight)
-				histos["base"] =
-				    histosDir.make<TH1F>(Form("D%d_B%03d_Baseline", disk, boardID),
-				                         Form("Baseline for D%d B%03d", disk, boardID),
-				                         20,
-				                         0,
-				                         20);
-				histos["base"]->GetXaxis()->SetTitle("Channel ID");
-				histos["base"]->GetYaxis()->SetTitle("Count");
-				histos["base"]->SetMarkerStyle(20);
-
-				// Baseline RMS per channel (noise proxy)
-				histos["rms"] =
-				    histosDir.make<TH1F>(Form("D%d_B%03d_RMS", disk, boardID),
-				                         Form("RMS for D%d B%03d", disk, boardID),
-				                         20,
-				                         0,
-				                         20);
-				histos["rms"]->GetXaxis()->SetTitle("Channel ID");
-				histos["rms"]->GetYaxis()->SetTitle("ADC RMS");
-				histos["rms"]->SetMarkerStyle(20);
-
-				// Peak ADC per channel (raw)
-				histos["max"] =
-				    histosDir.make<TH1F>(Form("D%d_B%03d_Max", disk, boardID),
-				                         Form("Max for D%d B%03d", disk, boardID),
-				                         20,
-				                         0,
-				                         20);
-				histos["max"]->GetXaxis()->SetTitle("Channel ID");
-				histos["max"]->GetYaxis()->SetTitle("Max ADC");
-				histos["max"]->SetMarkerStyle(20);
-			}
-
-			// Fill board-level summaries
-			histos["occ"]->Fill(chanID);
-			histos["base"]->Fill(chanID, baseline);
-			histos["rms"]->Fill(chanID, rms);
-			histos["max"]->Fill(chanID, ampRaw);
-
-			// Per-channel waveform histograms
-			//   - Live waveform: updated every time channel is seen
-			//   - Snapshot (FirstHit): created only the first time we see the channel
-			std::string wf_key = Form("D%d_B%03d_C%02d", disk, boardID, chanID);
-
-			if(!channelWaveformHistos_.count(wf_key))
-			{
-				TString cname = Form("%s_Waveform", wf_key.c_str());  // histogram key
-				TString ctitle =
-				    Form("D%d B%03d C%02d - Live Waveform", disk, boardID, chanID);
-
-				channelWaveformHistos_[wf_key] = histosDir.make<TH1F>(
-				    cname, ctitle, waveform.size(), 0, waveform.size());
-				channelWaveformHistos_[wf_key]->GetYaxis()->SetTitle("ADC Value");
-				channelWaveformHistos_[wf_key]->GetXaxis()->SetTitle("Tick");
-			}
-
-			TH1F* chanHist = channelWaveformHistos_[wf_key];
-			for(size_t i = 0; i < waveform.size(); ++i)
-			{
-				chanHist->SetBinContent(i + 1, waveform[i]);
-			}
-
-			// Create one-time snapshot in Channels/ on first encounter of this channel
-			if(channelWaveformStored_.count(wf_key) == 0)
-			{
-				art::TFileDirectory& chanDir = *cachedChannelsDirs_[boardKey];
-
-				TString cname  = Form("%s_FirstHit", wf_key.c_str());
-				TString ctitle = Form("D%d B%03d C%02d - Snapshot Waveform (first hit)",
-				                      disk,
-				                      boardID,
-				                      chanID);
-
-				TH1F* onehitHist = chanDir.make<TH1F>(
-				    cname, ctitle, waveform.size(), 0, waveform.size());
-				onehitHist->GetYaxis()->SetTitle("ADC Value");
-				onehitHist->GetXaxis()->SetTitle("Tick");
-
-				for(size_t i = 0; i < waveform.size(); ++i)
+				if(enableDiskMaps_)
 				{
-					onehitHist->SetBinContent(i + 1, waveform[i]);
-				}
+					const int dL = itL->second.disk;
+					const int dR = itR->second.disk;
+					const int d  = dL;
 
-				singleWaveformHistos_[wf_key] = onehitHist;
-				channelWaveformStored_.insert(wf_key);
+					accDisk(MapMode::Sum, d, evenId, sumLR);
+					accDisk(MapMode::Sum, d, oddId, sumLR);
+					accDisk(MapMode::Asym, d, evenId, asym);
+					accDisk(MapMode::Asym, d, oddId, asym);
 
-				// Contribute to global 2D summaries once per channel
-				h_global_board_vs_channel_->Fill(boardID, chanID);
-				for(size_t i = 0; i < waveform.size(); ++i)
-				{
-					h_global_waveform_density_->Fill(i, waveform[i]);
+					if(dL != dR)
+					{
+						mf::LogWarning("CaloDigiDQM")
+						    << "Disk mismatch for paired crystal " << crystalId
+						    << " (SiPM " << evenId << " in disk " << dL << ", SiPM "
+						    << oddId << " in disk " << dR << ").";
+					}
 				}
 			}
-		}  // end board/channel block
-	}      // end loop over digis
+		}
 
-	// Throttle streaming to every freqDQM events
+		// -----------------------
+		// Board-level histograms
+		// -----------------------
+		if(!enableBoardHistos_)
+			continue;
+
+		const std::pair<int, int> boardKey = std::make_pair(disk, boardID);
+
+		const bool boardKnown = (boardHistos_.find(boardKey) != boardHistos_.end());
+		auto&      boardsSeen = (disk == 0) ? boardsSeenDisk0_ : boardsSeenDisk1_;
+
+		// Enforce maxBoardHistos per disk (limit only NEW boards)
+		bool allowBoard = true;
+		if(!boardKnown && maxBoardHistos_ >= 0 &&
+		   (int)boardsSeen.size() >= maxBoardHistos_)
+			allowBoard = false;
+
+		if(!allowBoard)
+		{
+			if(!warnedBoardsSkipped_.count(boardKey))
+			{
+				mf::LogInfo("CaloDigiDQM")
+				    << "Skipping board-level histos/waveforms for D" << disk << " B"
+				    << boardID << " due to maxBoardHistos(per disk)=" << maxBoardHistos_
+				    << ".";
+				warnedBoardsSkipped_.insert(boardKey);
+			}
+			continue;
+		}
+
+		if(!boardKnown)
+			boardsSeen.insert(boardID);
+
+		// Lazy-create board directories
+		if(cachedHistosDirs_.find(boardKey) == cachedHistosDirs_.end())
+		{
+			art::TFileDirectory boardDir = (disk == 0 ? *disk0Dir_ : *disk1Dir_)
+			                                   .mkdir("Board_" + std::to_string(boardID));
+
+			cachedHistosDirs_[boardKey] =
+			    std::make_unique<art::TFileDirectory>(boardDir.mkdir("Histograms"));
+			cachedChannelsDirs_[boardKey] =
+			    std::make_unique<art::TFileDirectory>(boardDir.mkdir("Channels"));
+		}
+
+		art::TFileDirectory& histosDir = *cachedHistosDirs_[boardKey];
+		auto&                histos    = boardHistos_[boardKey];
+
+		// Book per-board summaries once
+		if(histos.empty())
+		{
+			histos["occ"] =
+			    histosDir.make<TH1F>(Form("D%d_B%03d_Occupancy", disk, boardID),
+			                         Form("Occupancy for D%d B%03d", disk, boardID),
+			                         kChannelsPerBoard,
+			                         0,
+			                         kChannelsPerBoard);
+			histos["occ"]->GetXaxis()->SetTitle("Channel ID");
+			histos["occ"]->GetYaxis()->SetTitle("Count");
+
+			histos["base"] =
+			    histosDir.make<TProfile>(Form("D%d_B%03d_Baseline", disk, boardID),
+			                             Form("Baseline for D%d B%03d", disk, boardID),
+			                             kChannelsPerBoard,
+			                             0,
+			                             kChannelsPerBoard);
+
+			histos["rms"] =
+			    histosDir.make<TProfile>(Form("D%d_B%03d_RMS", disk, boardID),
+			                             Form("RMS for D%d B%03d", disk, boardID),
+			                             kChannelsPerBoard,
+			                             0,
+			                             kChannelsPerBoard);
+
+			histos["max"] =
+			    histosDir.make<TProfile>(Form("D%d_B%03d_Max", disk, boardID),
+			                             Form("Max for D%d B%03d", disk, boardID),
+			                             kChannelsPerBoard,
+			                             0,
+			                             kChannelsPerBoard);
+
+			for(auto key : {"base", "rms", "max"})
+			{
+				histos[key]->GetXaxis()->SetTitle("Channel ID");
+				static_cast<TProfile*>(histos[key])->SetMarkerStyle(20);
+			}
+
+			histos["base"]->GetYaxis()->SetTitle("Mean Baseline [ADC]");
+			histos["rms"]->GetYaxis()->SetTitle("Mean RMS [ADC]");
+			histos["max"]->GetYaxis()->SetTitle("Mean Peak ADC [ADC]");
+		}
+
+		// Fill per-board summaries
+		histos["occ"]->Fill(chanID);
+		static_cast<TProfile*>(histos["base"])->Fill(chanID, baseline);
+		static_cast<TProfile*>(histos["rms"])->Fill(chanID, rms);
+		static_cast<TProfile*>(histos["max"])->Fill(chanID, ampRaw);
+
+		// -----------------------
+		// Waveforms (fixed binning)
+		// -----------------------
+		ChannelKey chKey{disk, boardID, chanID};
+
+		// Record waveform-size stats
+		{
+			const uint32_t sz = (uint32_t)waveform.size();
+			auto&          st = wfSizeStats_[chKey];
+
+			if(st.nSeen == 0)
+				st.first = st.last = st.min = st.max = sz;
+			else
+			{
+				if(sz != st.first)
+					st.nMismatchToFirst++;
+				if(sz != st.last)
+					st.nTransitions++;
+				if(sz < st.min)
+					st.min = sz;
+				if(sz > st.max)
+					st.max = sz;
+				st.last = sz;
+			}
+
+			st.nSeen++;
+			if(sz > (uint32_t)kWaveformNBins)
+				st.nTruncated++;
+			else if(sz < (uint32_t)kWaveformNBins)
+				st.nPadded++;
+		}
+
+		// Live waveform histogram (updated each hit -> last hit in ROOT file)
+		if(!channelWaveformHistos_.count(chKey))
+		{
+			TString cname  = Form("D%d_B%03d_C%02d_Waveform", disk, boardID, chanID);
+			TString ctitle = Form("Live Waveform for %s",
+			                      channelLabel(boardID, chanID, rawId, sipmId).Data());
+
+			channelWaveformHistos_[chKey] =
+			    histosDir.make<TH1F>(cname, ctitle, kWaveformNBins, 0, kWaveformNBins);
+			channelWaveformHistos_[chKey]->GetYaxis()->SetTitle("ADC Value");
+			channelWaveformHistos_[chKey]->GetXaxis()->SetTitle("Tick");
+		}
+		fillFixedWaveform(channelWaveformHistos_[chKey], waveform);
+
+		// One-hit snapshot (stored once per channel)
+		if(channelWaveformStored_.count(chKey) == 0)
+		{
+			art::TFileDirectory& chanDir = *cachedChannelsDirs_[boardKey];
+
+			TString cname  = Form("D%d_B%03d_C%02d_FirstHit", disk, boardID, chanID);
+			TString ctitle = Form("First-Hit Waveform for %s",
+			                      channelLabel(boardID, chanID, rawId, sipmId).Data());
+
+			TH1F* onehitHist =
+			    chanDir.make<TH1F>(cname, ctitle, kWaveformNBins, 0, kWaveformNBins);
+			onehitHist->GetYaxis()->SetTitle("ADC Value");
+			onehitHist->GetXaxis()->SetTitle("Tick");
+
+			fillFixedWaveform(onehitHist, waveform);
+
+			singleWaveformHistos_[chKey] = onehitHist;
+			channelWaveformStored_.insert(chKey);
+
+			// Contribute to global waveform density once per channel (first-hit snapshot)
+			const int nbx = h_global_waveform_density_->GetNbinsX();
+			const int n   = std::min<int>((int)waveform.size(), nbx);
+			for(int i = 0; i < n; ++i)
+				h_global_waveform_density_->Fill(i, (double)waveform[(size_t)i]);
+		}
+	}
+
+	// -----------------------
+	// Periodic refresh/stream
+	// -----------------------
 	++eventCounter_;
-	if(eventCounter_ % freqDQM_ != 0)
+	++waveformCounter_;
+
+	const bool doSummariesEvent = (freqDQM_ > 0) && (eventCounter_ % freqDQM_ == 0);
+	if(enableDiskMaps_ && doSummariesEvent)
+		refreshDiskMaps();
+
+	if(!sendHists_ || !histSender_)
 		return;
 
-	// ---------------------------
-	// Streaming to otsdaq
-	// ---------------------------
-	// hists_to_send groups are keyed by a path with an optional ":replace" suffix
-	// to instruct the receiver to atomically replace the group's contents.
+	const bool doWaveforms =
+	    (freqWaveforms_ > 0) && (waveformCounter_ % freqWaveforms_ == 0);
+	if(!doSummariesEvent && !doWaveforms)
+		return;
+
 	std::map<std::string, std::vector<TH1*>> hists_to_send;
 
-	// Global group (always sent): cross-disk summaries and integrity plots
-	hists_to_send[moduleTag_ + "/Global:replace"] = {h_occupancy_disk0_,
-	                                                 h_occupancy_disk1_,
-	                                                 h_baseline_disk0_,
-	                                                 h_baseline_disk1_,
-	                                                 h_rms_disk0_,
-	                                                 h_rms_disk1_,
-	                                                 h_maxval_disk0_,
-	                                                 h_maxval_disk1_,
-	                                                 h_asymmetry,
-	                                                 h_global_channel_dist_,
-	                                                 h_global_board_dist_,
-	                                                 h_global_board_vs_channel_,
-	                                                 h_global_waveform_density_,
-	                                                 h_baseline_vs_disk};
-
-	// Disk map groups, one subpath per mode (e.g., Module/DiskMaps/Amp)
-	if(sendHists_ && enableDiskMaps_)
+	// Summary groups
+	if(doSummariesEvent)
 	{
-		for(auto m : modes_)
-		{
-			const char* suf       = modeSuffix(m);
-			std::string groupPath = moduleTag_ + "/DiskMaps/" + suf + ":replace";
+		hists_to_send[moduleTag_ + "/Global:replace"] = {h_occupancy_disk0_,
+		                                                 h_occupancy_disk1_,
+		                                                 h_baseline_disk0_,
+		                                                 h_baseline_disk1_,
+		                                                 h_rms_disk0_,
+		                                                 h_rms_disk1_,
+		                                                 h_maxval_disk0_,
+		                                                 h_maxval_disk1_,
+		                                                 h_asymmetry,
+		                                                 h_global_channel_dist_,
+		                                                 h_global_board_dist_,
+		                                                 h_global_board_vs_channel_,
+		                                                 h_global_waveform_density_,
+		                                                 h_waveform_size_,
+		                                                 h_baseline_vs_disk};
 
-			if(disk0Maps_[m])
-				hists_to_send[groupPath].push_back(disk0Maps_[m]);
-			if(disk1Maps_[m])
-				hists_to_send[groupPath].push_back(disk1Maps_[m]);
+		if(enableDiskMaps_)
+		{
+			for(auto m : modes_)
+			{
+				std::string groupPath =
+				    moduleTag_ + "/DiskMaps/" + modeSuffix(m) + ":replace";
+				if(disk0Maps_[m])
+					hists_to_send[groupPath].push_back(disk0Maps_[m]);
+				if(disk1Maps_[m])
+					hists_to_send[groupPath].push_back(disk1Maps_[m]);
+			}
+		}
+
+		for(auto& [bk, hmap] : boardHistos_)
+		{
+			const int   disk    = bk.first;
+			const int   boardID = bk.second;
+			std::string groupPath =
+			    Form("%s/Disk%d/Board%03d:replace", moduleTag_.c_str(), disk, boardID);
+			for(auto& [_, h] : hmap)
+				hists_to_send[groupPath].push_back(h);
 		}
 	}
 
-	// Live waveforms grouped by disk and board
-	for(auto& [key, hist] : channelWaveformHistos_)
+	// Waveform groups – controlled by freqWaveforms
+	if(doWaveforms)
 	{
-		int disk, boardID, chanID;
-		sscanf(key.c_str(), "D%d_B%03d_C%02d", &disk, &boardID, &chanID);
-		std::string groupPath = Form(
-		    "%s/Waveforms/Disk%d/Board%03d:replace", moduleTag_.c_str(), disk, boardID);
-		hists_to_send[groupPath].push_back(hist);
-	}
-
-	// One-hit snapshot waveforms grouped similarly
-	for(auto& [key, hist] : singleWaveformHistos_)
-	{
-		int disk, boardID, chanID;
-		sscanf(key.c_str(), "D%d_B%03d_C%02d", &disk, &boardID, &chanID);
-		std::string groupPath = Form("%s/OneHitWaveforms/Disk%d/Board%03d:replace",
-		                             moduleTag_.c_str(),
-		                             disk,
-		                             boardID);
-		hists_to_send[groupPath].push_back(hist);
-	}
-
-	// Board summaries (occ/base/rms/max) grouped by disk/board
-	for(auto& [boardKey, hmap] : boardHistos_)
-	{
-		int         disk    = boardKey.first;
-		int         boardID = boardKey.second;
-		std::string groupPath =
-		    Form("%s/Disk%d/Board%03d:replace", moduleTag_.c_str(), disk, boardID);
-		for(auto& [_, h] : hmap)
+		for(auto& [k, hist] : channelWaveformHistos_)
 		{
-			hists_to_send[groupPath].push_back(h);
+			std::string groupPath = Form("%s/Waveforms/Disk%d/Board%03d:replace",
+			                             moduleTag_.c_str(),
+			                             k.disk,
+			                             k.board);
+			hists_to_send[groupPath].push_back(hist);
+		}
+
+		for(auto& [k, hist] : singleWaveformHistos_)
+		{
+			std::string groupPath = Form("%s/OneHitWaveforms/Disk%d/Board%03d:replace",
+			                             moduleTag_.c_str(),
+			                             k.disk,
+			                             k.board);
+			hists_to_send[groupPath].push_back(hist);
 		}
 	}
 
-	if(sendHists_ && histSender_)
+	// Send with error backoff
+	try
 	{
 		histSender_->sendHistograms(hists_to_send);
-		std::cout << "Sending " << hists_to_send.size() << " histogram groups"
-		          << std::endl;
-		for(const auto& [dir, vec] : hists_to_send)
-		{
-			std::cout << "Group: " << dir << " - " << vec.size() << " hists" << std::endl;
-		}
+		histSendErrorCount_ = 0;
+	}
+	catch(const std::exception& e)
+	{
+		++histSendErrorCount_;
+		mf::LogError("CaloDigiDQM") << "HistoSender::sendHistograms exception ("
+		                            << histSendErrorCount_ << "): " << e.what();
+		if(histSendErrorCount_ >= kMaxSendErrors_)
+			sendHists_ = false;
+	}
+	catch(...)
+	{
+		++histSendErrorCount_;
+		mf::LogError("CaloDigiDQM") << "HistoSender::sendHistograms non-std exception ("
+		                            << histSendErrorCount_ << ").";
+		if(histSendErrorCount_ >= kMaxSendErrors_)
+			sendHists_ = false;
 	}
 }
 
 // ===========================
 // endJob()
 // ===========================
-void CaloDQMOffline::endJob() {}
+void CaloDigiDQM::endJob()
+{
+	// Final disk-map rebuild (so ROOT file has the latest means)
+	if(enableDiskMaps_)
+		refreshDiskMaps();
+
+	// Basic run summary
+	mf::LogInfo("CaloDigiDQM") << "CaloDigiDQM summary:"
+	                           << " events=" << eventCounter_ << " d0=" << nFillDisk0_
+	                           << " d1=" << nFillDisk1_ << " miss=" << nFillMiss_
+	                           << " sendErr=" << histSendErrorCount_
+	                           << " badSipmId=" << nBadSipmId_;
+
+	// Waveform-size report
+	struct Row
+	{
+		ChannelKey        k;
+		WaveformSizeStats st;
+	};
+
+	std::vector<Row> offenders;
+	offenders.reserve(wfSizeStats_.size());
+
+	for(const auto& [k, st] : wfSizeStats_)
+	{
+		if(st.min != st.max)
+			offenders.push_back(Row{k, st});
+	}
+
+	std::sort(offenders.begin(), offenders.end(), [](const Row& a, const Row& b) {
+		if(a.st.nTransitions != b.st.nTransitions)
+			return a.st.nTransitions > b.st.nTransitions;
+		const uint32_t ra = a.st.max - a.st.min;
+		const uint32_t rb = b.st.max - b.st.min;
+		if(ra != rb)
+			return ra > rb;
+		return a.st.nMismatchToFirst > b.st.nMismatchToFirst;
+	});
+
+	mf::LogInfo("CaloDigiDQM") << "Waveform-size summary:"
+	                           << " channels=" << wfSizeStats_.size()
+	                           << " variable=" << offenders.size()
+	                           << " nbins=" << kWaveformNBins;
+
+	const size_t top = std::min<size_t>(20, offenders.size());
+	if(top)
+	{
+		std::ostringstream os;
+		os << "Top " << top << " variable-size channels:\n";
+		for(size_t i = 0; i < top; ++i)
+		{
+			const auto& r = offenders[i];
+			os << "  (D" << r.k.disk << " B" << r.k.board << " C" << r.k.chan << ")"
+			   << " first=" << r.st.first << " min=" << r.st.min << " max=" << r.st.max
+			   << " seen=" << r.st.nSeen << " trans=" << r.st.nTransitions
+			   << " mismatch=" << r.st.nMismatchToFirst << " pad=" << r.st.nPadded
+			   << " trunc=" << r.st.nTruncated << "\n";
+		}
+		mf::LogInfo("CaloDigiDQM") << os.str();
+	}
+}
 
 }  // namespace mu2e
 
-DEFINE_ART_MODULE(mu2e::CaloDQMOffline);
+DEFINE_ART_MODULE(mu2e::CaloDigiDQM);
